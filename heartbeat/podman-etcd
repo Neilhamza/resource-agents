@@ -1173,12 +1173,36 @@ add_member_as_learner()
 	return $OCF_ERR_GENERIC
 }
 
-set_force_new_cluster()
+# Set the reboot-lifetime force_new_cluster attribute for this node,
+# unless another node already holds it.
+#
+# The holder pre-check is best-effort: a concurrent write can still land
+# between check and set. The post-set guard in podman_start and the
+# multi-holder tiebreaker (fnc_conflict_verdict) remain the authoritative
+# resolution for any race that slips through.
+#
+# Return codes:
+#   0 - attribute set (holders were empty or self-only)
+#   1 - crm/CIB error (caller: soft-fail)
+#   2 - another node already holds force_new_cluster (caller: defer/yield)
+try_set_force_new_cluster()
 {
-	local rc
+	local rc fnc_holders holder
+
+	if ! fnc_holders=$(get_force_new_cluster); then
+		ocf_log err "could not query force_new_cluster holders before setting"
+		return 1
+	fi
+
+	for holder in $fnc_holders; do
+		if [ "$holder" != "$NODENAME" ]; then
+			ocf_log info "force_new_cluster already held by ${fnc_holders% }: not setting"
+			return 2
+		fi
+	done
 
 	if [ -n "$OCF_RESKEY_test_race_delay" ]; then
-		ocf_log notice "TEST: race delay ${OCF_RESKEY_test_race_delay}s before force_new_cluster write"
+		ocf_log notice "TEST: race delay ${OCF_RESKEY_test_race_delay}s between force_new_cluster pre-check and write"
 		sleep "$OCF_RESKEY_test_race_delay"
 	fi
 
@@ -1186,8 +1210,9 @@ set_force_new_cluster()
 	rc=$?
 	if [ $rc -ne 0 ]; then
 		ocf_log err "could not set force_new_cluster attribute to $NODENAME"
+		return 1
 	fi
-	return $rc
+	return 0
 }
 
 # get_force_new_cluster returns a space-separated list of nodes that have the force_new_cluster attribute set.
@@ -1754,9 +1779,30 @@ detect_cluster_leadership_loss()
 		ocf_log info "one endpoint only: checking status errors"
 		endpoint_status_errors=$(printf "%s" "$endpoint_status_json" | jq -r ".[0].Status.errors")
 		if echo "$endpoint_status_errors" | grep -q "no leader"; then
-			set_force_new_cluster
-			set_standalone_node
-			ocf_exit_reason "$NODENAME must force a new cluster"
+			# Pre-check adds crm_node + attrd queries (small overhead)
+			# on an already-failing path that returns error regardless.
+			try_set_force_new_cluster
+			case $? in
+			0)
+				set_standalone_node
+				ocf_exit_reason "$NODENAME must force a new cluster"
+				;;
+			2)
+				# Peer already claimed recovery: do NOT assert standalone.
+				# The restart triggered below lands in podman_start, which
+				# sees the peer's FNC and joins as learner.
+				# If the holder crashed after claiming, its reboot-lifetime
+				# attribute persists until pacemaker registers membership
+				# loss; we defer to a stale claim during that window.
+				# Bounded by fencing timeout — same exposure as the
+				# single-holder early-learner path.
+				ocf_log notice "leadership lost but peer already holds force_new_cluster: deferring to peer"
+				ocf_exit_reason "$NODENAME deferring recovery to force_new_cluster holder"
+				;;
+			*)
+				ocf_exit_reason "could not set or verify force_new_cluster during leadership-loss recovery"
+				;;
+			esac
 			return $OCF_ERR_GENERIC
 		fi
 		if [ "$endpoint_status_errors" != "null" ]; then
@@ -2590,9 +2636,18 @@ podman_start()
 		elif [ -n "$peer_removal_lock" ]; then
 			ocf_log notice "member_removal_lock held by peer $startup_peer_node (epoch=$peer_removal_lock): we are the surviving voter - forcing new cluster to seed"
 			if ! is_force_new_cluster; then
-				if ! set_force_new_cluster; then
+				try_set_force_new_cluster
+				case $? in
+				0) ;;
+				2)
+					ocf_exit_reason "$NODENAME: cannot seed cluster: peer holds force_new_cluster despite having departed via member_removal_lock; clear the stale claim: crm_attribute --delete --lifetime reboot --node $startup_peer_node --name force_new_cluster"
 					return "$OCF_ERR_GENERIC"
-				fi
+					;;
+				*)
+					ocf_exit_reason "$NODENAME: could not set force_new_cluster to seed cluster"
+					return "$OCF_ERR_GENERIC"
+					;;
+				esac
 			fi
 			JOIN_AS_LEARNER=false
 			removal_lock_decided=true
@@ -2753,9 +2808,18 @@ podman_start()
 						# If our revision is the same as or newer than the peer's last saved
 						# revision, and the peer agent isn't currently starting, we can
 						# restore e-quorum by forcing a new cluster.
-						if ! set_force_new_cluster; then
+						try_set_force_new_cluster
+						case $? in
+						0) ;;
+						2)
+							ocf_log notice "peer claimed force_new_cluster first: joining as learner"
+							JOIN_AS_LEARNER=true
+							;;
+						*)
+							ocf_exit_reason "$NODENAME: could not set or verify force_new_cluster attribute"
 							return "$OCF_ERR_GENERIC"
-						fi
+							;;
+						esac
 					else
 						ocf_log err "local revision is older and peer is not starting: cannot start"
 						ocf_exit_reason "local revision is older and peer is not starting: cannot start"
@@ -2766,9 +2830,25 @@ podman_start()
 					# TODO: can we start "normally", regardless the revisions, if the container-id is the same on both nodes?
 					ocf_log info "peer starting"
 					if [ "$revision_compare_result" = "newer" ]; then
-						if ! set_force_new_cluster; then
+						try_set_force_new_cluster
+						case $? in
+						0) ;;
+						2)
+							# Peer won the race despite our "newer" verdict.
+							# Deferring is still safe: both nodes'
+							# comparisons and the tiebreaker all read the
+							# same saved CIB attributes, so contesting
+							# would not produce a better-informed winner.
+							# See the multi-holder branch above for the
+							# full adjudication logic.
+							ocf_log notice "peer claimed force_new_cluster first: joining as learner"
+							JOIN_AS_LEARNER=true
+							;;
+						*)
+							ocf_exit_reason "$NODENAME: could not set or verify force_new_cluster attribute"
 							return "$OCF_ERR_GENERIC"
-						fi
+							;;
+						esac
 					elif [ "$revision_compare_result" = "older" ]; then
 						ocf_log info "$NODENAME shall join as learner"
 						JOIN_AS_LEARNER=true
